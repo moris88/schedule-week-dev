@@ -9,24 +9,24 @@
 		"check": "biome check"
 	},
 	"dependencies": {
-		"jotai": "^2.7.0",
+		"jotai": "^2.20.3",
 		"lucide-react": "^0.359.0",
-		"react": "^18.2.0",
-		"react-dom": "^18.2.0",
+		"react": "^18.3.1",
+		"react-dom": "^18.3.1",
 		"uuid": "^14.0.2"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.4.16",
 		"@types/node": "^26.6.3",
-		"@types/react": "^18.2.66",
-		"@types/react-dom": "^18.2.22",
-		"@vitejs/plugin-react": "^4.2.1",
-		"autoprefixer": "^10.4.19",
+		"@types/react": "^18.3.31",
+		"@types/react-dom": "^18.3.7",
+		"@vitejs/plugin-react": "^4.7.0",
+		"autoprefixer": "^10.6.1",
 		"esbuild": "^0.28.2",
-		"postcss": "^8.4.38",
+		"postcss": "^8.5.28",
 		"tailwindcss": "^3.4.19",
 		"tsx": "^4.23.15",
-		"typescript": "^5.4.2",
-		"vite": "^5.1.6"
+		"typescript": "^5.9.3",
+		"vite": "^5.4.21"
 	}
 }
