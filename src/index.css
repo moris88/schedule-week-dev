@@ -315,23 +315,104 @@ body {
 .event-color-emergency {
 	background: #f43f5e;
 }
-
-@keyframes emergency-pulse {
-	0%,
-	100% {
-		box-shadow: inset 0 0 0 1px rgb(255 255 255 / 8%);
-		filter: brightness(1);
-	}
-	50% {
-		box-shadow:
-			inset 0 0 0 1px rgb(255 255 255 / 52%),
-			0 0 11px rgb(244 63 94 / 45%);
-		filter: brightness(1.18);
-	}
+.event-color-vacation {
+	background: #c084fc;
+}
+.event-color-leave {
+	background: #e879f9;
+}
+.event-color-fixed {
+	background: #94a3b8;
+}
+.event-color-custom {
+	background: #38bdf8;
+}
+.event-color-break {
+	background: #475569;
 }
 
-@media (prefers-reduced-motion: reduce) {
-	.schedule-event--urgent-blink {
-		animation: none;
-	}
+.schedule-event--vacation {
+	border-color: #c084fc;
+	background: repeating-linear-gradient(
+		135deg,
+		rgb(88 28 135 / 85%) 0 10px,
+		rgb(59 7 100 / 85%) 10px 20px
+	);
+	color: #faf5ff;
+}
+
+.schedule-event--leave {
+	border-color: #e879f9;
+	background: #5b1e63;
+	color: #fdf4ff;
+	outline: 1px dashed rgb(232 121 249 / 70%);
+	outline-offset: -2px;
+}
+
+.schedule-event--fixed {
+	border-color: #94a3b8;
+	background: #334155;
+}
+
+.schedule-event--holiday {
+	background: repeating-linear-gradient(
+		135deg,
+		rgb(127 29 29 / 30%) 0 6px,
+		rgb(15 23 42 / 30%) 6px 12px
+	);
+}
+
+.schedule-day-column--holiday {
+	opacity: 0.8;
+}
+
+.schedule-cell--closed {
+	background: rgb(15 23 42 / 70%);
+}
+
+.schedule-event--past {
+	filter: saturate(0.35) brightness(0.7);
+	opacity: 0.6;
+}
+
+.schedule-event--in-progress {
+	box-shadow:
+		0 0 0 1px #34d399,
+		0 0 10px rgb(52 211 153 / 35%);
+}
+
+.schedule-event--in-progress .schedule-event-badge {
+	border-color: #34d399;
+	background: #065f46;
+	color: #d1fae5;
+}
+
+.schedule-event--declined {
+	opacity: 0.45;
+	text-decoration: line-through;
+}
+
+.schedule-event--conflict {
+	box-shadow: 0 0 0 2px #ef4444;
+}
+
+.schedule-now-line {
+	position: absolute;
+	z-index: 4;
+	right: 0;
+	left: 0;
+	height: 2px;
+	background: #ef4444;
+	pointer-events: none;
+}
+
+.schedule-now-line::before {
+	position: absolute;
+	top: -4px;
+	left: -4px;
+	width: 10px;
+	height: 10px;
+	border-radius: 9999px;
+	background: #ef4444;
+	content: "";
 }

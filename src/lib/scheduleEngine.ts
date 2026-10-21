@@ -1,775 +1,798 @@
 import {
-  type CalendarEvent,
-  DAILY_BUFFER_MINUTES,
-  DAYS,
-  type Emergency,
-  type EventType,
-  FIXED_BLOCKS,
-  type Project,
-  type ProjectPriority,
-} from "./scheduler";
+	addDays,
+	atTime,
+	type CalendarEvent,
+	DAILY_CAPS,
+	dateKey,
+	dayEnd,
+	dayIndex,
+	durationOf,
+	type EventType,
+	isWorkingDay,
+	localDateTime,
+	overlaps,
+	PRIORITY,
+	type Project,
+	type ProjectPriority,
+	projectType,
+	type Settings,
+	TYPE_LABELS,
+	toMinutes,
+	WEEKLY_MAX,
+	weekDays,
+} from './scheduler'
 
 interface Interval {
-  start: Date;
-  end: Date;
+	start: Date
+	end: Date
 }
 
-export interface ScheduleOptions {
-  weeklyBudgets: { P1: number; P2: number };
-  meetings: CalendarEvent[];
-  manualEvents: CalendarEvent[];
-  now?: Date;
+export interface WeekInput {
+	events: CalendarEvent[]
+	projects: Project[]
+	declinedFixed: string[]
 }
 
-export interface ScheduleResult {
-  events: CalendarEvent[];
-  availableEmergencySlots: CalendarEvent[];
-  projectMinutes: Record<ProjectPriority, number>;
-  priorityWarnings: ProjectPriority[];
-  bufferMinutes: number;
-  emergencyMinutes: number;
-  unscheduledEmergencyMinutes: number;
+export interface Conflict {
+	id: string
+	higher: CalendarEvent
+	lower: CalendarEvent
 }
 
-const minutes = (date: Date) => date.getTime() / 60_000;
-const dateKey = (date: Date) =>
-  `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-
-function atTime(day: Date, time: string): Date {
-  const [hours, minute] = time.split(":").map(Number);
-  const result = new Date(day);
-  result.setHours(hours, minute, 0, 0);
-  return result;
-}
-
-function localDateTime(date: Date): string {
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:00`;
-}
+const QUARTER = 15
+const minutesOf = (interval: Interval) =>
+	(interval.end.getTime() - interval.start.getTime()) / 60_000
 
 function subtract(intervals: Interval[], blocked: Interval): Interval[] {
-  return intervals.flatMap((interval) => {
-    if (blocked.end <= interval.start || blocked.start >= interval.end)
-      return [interval];
-    const result: Interval[] = [];
-    if (blocked.start > interval.start)
-      result.push({ start: interval.start, end: blocked.start });
-    if (blocked.end < interval.end)
-      result.push({ start: blocked.end, end: interval.end });
-    return result;
-  });
+	return intervals.flatMap((interval) => {
+		if (blocked.end <= interval.start || blocked.start >= interval.end)
+			return [interval]
+		const result: Interval[] = []
+		if (blocked.start > interval.start)
+			result.push({ start: interval.start, end: blocked.start })
+		if (blocked.end < interval.end)
+			result.push({ start: blocked.end, end: interval.end })
+		return result
+	})
 }
 
-function takeFromEnd(intervals: Interval[], requested: number) {
-  const remaining = intervals.map((interval) => ({ ...interval }));
-  const selected: Interval[] = [];
-  let unallocated = requested;
-  for (
-    let index = remaining.length - 1;
-    index >= 0 && unallocated > 0;
-    index -= 1
-  ) {
-    const interval = remaining[index];
-    const duration = Math.min(
-      unallocated,
-      minutes(interval.end) - minutes(interval.start),
-    );
-    if (duration <= 0) continue;
-    const start = new Date(interval.end.getTime() - duration * 60_000);
-    selected.unshift({ start, end: interval.end });
-    interval.end = start;
-    unallocated -= duration;
-    if (interval.start >= interval.end) remaining.splice(index, 1);
-  }
-  return { selected, remaining, unallocated };
-}
-
-function takeFromStart(intervals: Interval[], requested: number) {
-  const remaining = intervals.map((interval) => ({ ...interval }));
-  const selected: Interval[] = [];
-  let unallocated = requested;
-  for (let index = 0; index < remaining.length && unallocated > 0; index += 1) {
-    const interval = remaining[index];
-    const duration = Math.min(
-      unallocated,
-      minutes(interval.end) - minutes(interval.start),
-    );
-    if (duration <= 0) continue;
-    const end = new Date(interval.start.getTime() + duration * 60_000);
-    selected.push({ start: interval.start, end });
-    interval.start = end;
-    unallocated -= duration;
-    if (interval.start >= interval.end) {
-      remaining.splice(index, 1);
-      index -= 1;
-    }
-  }
-  return { selected, remaining, unallocated };
-}
-
-function claimExact(intervals: Interval[], wanted: Interval): boolean {
-  const index = intervals.findIndex(
-    (interval) => interval.start <= wanted.start && interval.end >= wanted.end,
-  );
-  if (index < 0) return false;
-  const interval = intervals[index];
-  intervals.splice(
-    index,
-    1,
-    ...[
-      ...(interval.start < wanted.start
-        ? [{ start: interval.start, end: wanted.start }]
-        : []),
-      ...(wanted.end < interval.end
-        ? [{ start: wanted.end, end: interval.end }]
-        : []),
-    ],
-  );
-  return true;
-}
-
-function takeContiguous(
-  intervals: Interval[],
-  duration: number,
-): Interval | undefined {
-  const index = intervals.findIndex(
-    (interval) => minutes(interval.end) - minutes(interval.start) >= duration,
-  );
-  if (index < 0) return undefined;
-  const interval = intervals[index];
-  const selected = {
-    start: interval.start,
-    end: new Date(interval.start.getTime() + duration * 60_000),
-  };
-  interval.start = selected.end;
-  if (interval.start >= interval.end) intervals.splice(index, 1);
-  return selected;
-}
-
-function takeAtOrAfter(
-  intervals: Interval[],
-  earliest: Date,
-  duration: number,
-): Interval | undefined {
-  for (let index = 0; index < intervals.length; index += 1) {
-    const interval = intervals[index];
-    const start = new Date(
-      Math.max(interval.start.getTime(), earliest.getTime()),
-    );
-    if (minutes(interval.end) - minutes(start) < duration) continue;
-    const selected = {
-      start,
-      end: new Date(start.getTime() + duration * 60_000),
-    };
-    intervals.splice(
-      index,
-      1,
-      ...(interval.start < selected.start
-        ? [{ start: interval.start, end: selected.start }]
-        : []),
-      ...(selected.end < interval.end
-        ? [{ start: selected.end, end: interval.end }]
-        : []),
-    );
-    return selected;
-  }
-  return undefined;
+function roundUpToQuarter(date: Date): Date {
+	const result = new Date(date)
+	result.setSeconds(0, 0)
+	const minute = result.getMinutes()
+	const rounded = Math.ceil(minute / QUARTER) * QUARTER
+	result.setMinutes(rounded)
+	return result
 }
 
 function makeEvent(
-  id: string,
-  title: string,
-  interval: Interval,
-  type: EventType,
-  options: Partial<
-    Pick<
-      CalendarEvent,
-      "fixed" | "editable" | "display" | "projectId" | "emergencyId" | "status"
-    >
-  > = {},
+	id: string,
+	title: string,
+	interval: Interval,
+	type: EventType,
+	extra: Partial<CalendarEvent> = {},
 ): CalendarEvent {
-  return {
-    id,
-    title,
-    start: localDateTime(interval.start),
-    end: localDateTime(interval.end),
-    type,
-    fixed: options.fixed ?? false,
-    editable: options.editable ?? true,
-    ...options,
-  };
+	return {
+		id,
+		title,
+		start: localDateTime(interval.start),
+		end: localDateTime(interval.end),
+		type,
+		source: 'auto',
+		...extra,
+	}
 }
 
-function dayIndex(date: Date): number {
-  return (date.getDay() + 6) % 7;
+export const isBackground = (event: CalendarEvent) =>
+	event.display === 'background'
+
+/** Eventi generati dalle impostazioni: pause, preparazione, festivi e blocchi obbligatori. */
+export function frameEvents(
+	weekStart: Date,
+	settings: Settings,
+	declinedFixed: string[],
+): CalendarEvent[] {
+	const events: CalendarEvent[] = []
+	for (const day of weekDays(settings, weekStart)) {
+		const end = dayEnd(settings, day.index)
+		if (day.holiday) {
+			events.push(
+				makeEvent(
+					`holiday-${day.key}`,
+					'Festivo',
+					{
+						start: atTime(day.date, settings.workStart),
+						end: atTime(day.date, end),
+					},
+					'HOLIDAY',
+					{ display: 'background' },
+				),
+			)
+			continue
+		}
+		if (toMinutes(settings.lunchEnd) > toMinutes(settings.lunchStart))
+			events.push(
+				makeEvent(
+					`lunch-${day.key}`,
+					'Pausa pranzo',
+					{
+						start: atTime(day.date, settings.lunchStart),
+						end: atTime(day.date, settings.lunchEnd),
+					},
+					'BREAK',
+					{ display: 'background' },
+				),
+			)
+		if (settings.setupMinutes > 0) {
+			const start = atTime(day.date, settings.workStart)
+			events.push(
+				makeEvent(
+					`setup-${day.key}`,
+					'Preparazione postazione',
+					{
+						start,
+						end: new Date(start.getTime() + settings.setupMinutes * 60_000),
+					},
+					'SETUP',
+					{ display: 'background' },
+				),
+			)
+		}
+		for (const block of settings.fixedBlocks.filter(
+			(item) => item.day === day.index,
+		)) {
+			const id = `fixed-${block.id}-${day.key}`
+			events.push(
+				makeEvent(
+					id,
+					block.title,
+					{
+						start: atTime(day.date, block.start),
+						end: atTime(day.date, block.end),
+					},
+					'FIXED',
+					{ declined: declinedFixed.includes(id) },
+				),
+			)
+		}
+	}
+	return events
 }
 
-function projectPriority(type: EventType): ProjectPriority | undefined {
-  if (type === "PROJECT_P1") return "P1";
-  if (type === "PROJECT_P2") return "P2";
-  if (type === "PROJECT_P3") return "P3";
-  return undefined;
+/** Un evento occupa il calendario se non è di sfondo e non è stato rifiutato. */
+export const occupies = (event: CalendarEvent) =>
+	!isBackground(event) && !event.declined
+
+function workWindow(settings: Settings, date: Date): Interval[] {
+	if (!isWorkingDay(settings, date)) return []
+	const index = dayIndex(date)
+	let free: Interval[] = [
+		{
+			start: atTime(date, settings.workStart),
+			end: atTime(date, dayEnd(settings, index)),
+		},
+	]
+	free = subtract(free, {
+		start: atTime(date, settings.lunchStart),
+		end: atTime(date, settings.lunchEnd),
+	})
+	if (settings.setupMinutes > 0) {
+		const start = atTime(date, settings.workStart)
+		free = subtract(free, {
+			start,
+			end: new Date(start.getTime() + settings.setupMinutes * 60_000),
+		})
+	}
+	return free
 }
 
-export function buildSchedule(
-  weekStart: Date,
-  projects: Project[],
-  emergencies: Emergency[],
-  options: ScheduleOptions,
-): ScheduleResult {
-  const events: CalendarEvent[] = [];
-  const availableEmergencySlots: CalendarEvent[] = [];
-  const freeByDay: Interval[][] = [];
-  const emergencySlotIntervalsByDay: Interval[][] = DAYS.map(() => []);
-  const projectMinutes: Record<ProjectPriority, number> = {
-    P1: 0,
-    P2: 0,
-    P3: 0,
-  };
-  const manualDailyMinutes: Record<ProjectPriority, number[]> = {
-    P1: DAYS.map(() => 0),
-    P2: DAYS.map(() => 0),
-    P3: DAYS.map(() => 0),
-  };
-  let bufferMinutes = 0;
-  let emergencyMinutes = 0;
-  let unscheduledEmergencyMinutes = 0;
-
-  DAYS.forEach((dayName, index) => {
-    const day = new Date(weekStart);
-    day.setDate(day.getDate() + index);
-    const close = index === 4 ? "16:00" : "18:00";
-    let free: Interval[] = [
-      { start: atTime(day, "09:00"), end: atTime(day, "13:00") },
-      { start: atTime(day, "14:00"), end: atTime(day, close) },
-    ];
-
-    events.push(
-      makeEvent(
-        `lunch-${index}`,
-        "Pausa pranzo",
-        { start: atTime(day, "13:00"), end: atTime(day, "14:00") },
-        "BREAK",
-        { fixed: true, editable: false, display: "background" },
-      ),
-    );
-    FIXED_BLOCKS.filter((block) => block.day === index).forEach((block) => {
-      const interval = {
-        start: atTime(day, block.start),
-        end: atTime(day, block.end),
-      };
-      free = subtract(free, interval);
-      events.push(
-        makeEvent(
-          `fixed-${index}-${block.start}`,
-          block.title,
-          interval,
-          block.type,
-          { fixed: true, editable: false },
-        ),
-      );
-    });
-
-    const emptyWindows =
-      index === 0
-        ? [{ start: "14:00", end: "14:15" }]
-        : index >= 1 && index <= 3
-          ? [{ start: "09:00", end: "09:15" }]
-          : [];
-    emptyWindows.forEach(({ start, end }, gapIndex) => {
-      const interval = { start: atTime(day, start), end: atTime(day, end) };
-      free = subtract(free, interval);
-      events.push(
-        makeEvent(
-          `gap-${index}-${gapIndex}`,
-          "Intervallo fisso · lasciare libero",
-          interval,
-          "GAP",
-          { fixed: true, editable: false, display: "background" },
-        ),
-      );
-    });
-
-    if (index === 2)
-      events.push(
-        makeEvent(
-          "focus-wed",
-          "Focus · no call",
-          { start: atTime(day, "14:00"), end: atTime(day, "18:00") },
-          "FOCUS",
-          { fixed: true, editable: false, display: "background" },
-        ),
-      );
-    if (index === 4) {
-      events.push(
-        makeEvent(
-          "focus-fri-am",
-          "No call · sviluppo e formazione",
-          { start: atTime(day, "09:00"), end: atTime(day, "13:00") },
-          "FOCUS",
-          { fixed: true, editable: false, display: "background" },
-        ),
-      );
-      events.push(
-        makeEvent(
-          "focus-fri-pm",
-          "No call · sviluppo e formazione",
-          { start: atTime(day, "14:00"), end: atTime(day, "15:30") },
-          "FOCUS",
-          { fixed: true, editable: false, display: "background" },
-        ),
-      );
-    }
-
-    options.meetings
-      .filter((meeting) => dateKey(new Date(meeting.start)) === dateKey(day))
-      .forEach((meeting) => {
-        const interval = {
-          start: new Date(meeting.start),
-          end: new Date(meeting.end),
-        };
-        free = subtract(free, interval);
-        events.push({ ...meeting, fixed: false, editable: true });
-      });
-
-    const dayEmergencies = emergencies.filter(
-      (emergency) => emergency.day === dayName,
-    );
-    const floatingEmergencies = dayEmergencies.filter(
-      (emergency) => !emergency.startTime,
-    );
-    const reserved = takeFromEnd(free, DAILY_BUFFER_MINUTES[index]);
-    free = reserved.remaining;
-    let emergencySlots = reserved.selected;
-
-    dayEmergencies
-      .filter((emergency) => emergency.startTime)
-      .forEach((emergency) => {
-        const start = atTime(day, emergency.startTime!);
-        const end = emergency.endTime
-          ? atTime(day, emergency.endTime)
-          : new Date(start.getTime() + emergency.durationMinutes * 60_000);
-        const interval = {
-          start,
-          end,
-        };
-        const durationMinutes = minutes(end) - minutes(start);
-        const usedBuffer = claimExact(emergencySlots, interval);
-        const placedOutsideBuffer = !usedBuffer && claimExact(free, interval);
-        if (!usedBuffer && !placedOutsideBuffer) {
-          unscheduledEmergencyMinutes += durationMinutes;
-          return;
-        }
-        emergencyMinutes += durationMinutes;
-        events.push(
-          makeEvent(emergency.id, emergency.title, interval, "EMERGENCY", {
-            emergencyId: emergency.id,
-            status: emergency.status ?? "TODO",
-          }),
-        );
-      });
-
-    floatingEmergencies.forEach((emergency) => {
-      const placed = takeFromStart(emergencySlots, emergency.durationMinutes);
-      emergencySlots = placed.remaining;
-      placed.selected.forEach((interval, part) => {
-        events.push(
-          makeEvent(
-            `${emergency.id}-${part}`,
-            emergency.title,
-            interval,
-            "EMERGENCY",
-            { emergencyId: emergency.id, status: emergency.status ?? "TODO" },
-          ),
-        );
-        emergencyMinutes += minutes(interval.end) - minutes(interval.start);
-      });
-      unscheduledEmergencyMinutes += placed.unallocated;
-    });
-
-    emergencySlotIntervalsByDay[index].push(...emergencySlots);
-
-    freeByDay.push(free);
-  });
-
-  const activeP1 = projects.find(
-    (project) => project.priority === "P1" && project.name.trim(),
-  );
-  const activeP2 = projects.find(
-    (project) => project.priority === "P2" && project.name.trim(),
-  );
-  const p3Projects = projects.filter(
-    (project) => project.priority === "P3" && project.name.trim(),
-  );
-
-  const manualEvents = [...options.manualEvents].sort((a, b) => {
-    const rank = (event: CalendarEvent) =>
-      (
-        ({
-          PROJECT_P1: 0,
-          PROJECT_P2: 1,
-          PROJECT_P3: 2,
-          CUSTOM: 3,
-          FIX_BUFFER: 4,
-        }) as Record<string, number>
-      )[event.type] ?? 5;
-    return rank(a) - rank(b) || a.start.localeCompare(b.start);
-  });
-  const projectSlots = freeByDay.map((intervals) => [...intervals]);
-
-  manualEvents.forEach((manual) => {
-    const priority = projectPriority(manual.type);
-    const originalStart = new Date(manual.start);
-    const originalEnd = new Date(manual.end);
-    const duration = minutes(originalEnd) - minutes(originalStart);
-    const index = dayIndex(originalStart);
-    if (index < 0 || index > 4 || duration <= 0) return;
-    const exact = { start: originalStart, end: originalEnd };
-    if (manual.type === "CUSTOM") return;
-    if (!priority || priority === "P3") return;
-    const weeklyLimit = priority === "P1" ? 1200 : 600;
-    const dailyLimit = priority === "P1" ? 240 : 120;
-    if (duration > weeklyLimit - projectMinutes[priority]) return;
-
-    let placed: Interval | undefined;
-    const dayOrder = [
-      ...Array.from(
-        { length: projectSlots.length - index },
-        (_, offset) => index + offset,
-      ),
-      ...Array.from({ length: index }, (_, earlierDay) => earlierDay),
-    ];
-    for (const day of dayOrder) {
-      if (duration > dailyLimit - manualDailyMinutes[priority][day]) continue;
-      if (day === index && claimExact(projectSlots[day], exact)) {
-        placed = exact;
-        break;
-      }
-      placed = takeContiguous(projectSlots[day], duration);
-      if (placed) break;
-    }
-    if (!placed) {
-      unscheduledEmergencyMinutes += 0;
-      return;
-    }
-    events.push({
-      ...manual,
-      start: localDateTime(placed.start),
-      end: localDateTime(placed.end),
-    });
-    projectMinutes[priority] += duration;
-    manualDailyMinutes[priority][dayIndex(placed.start)] += duration;
-  });
-
-  const assigned = { ...projectMinutes };
-  const p1Project = activeP1;
-  const p1Type: EventType = "PROJECT_P1";
-  const p1Budget = Math.max(
-    0,
-    Math.min(1200, Math.max(600, options.weeklyBudgets.P1)) - projectMinutes.P1,
-  );
-  const p2Budget = activeP2
-    ? Math.max(
-        0,
-        Math.min(600, Math.max(360, options.weeklyBudgets.P2)) -
-          projectMinutes.P2,
-      )
-    : 0;
-
-  const allocate = (
-    index: number,
-    project: Project,
-    type: EventType,
-    requested: number,
-    priority: ProjectPriority,
-    part: number,
-  ) => {
-    const taken = takeFromStart(projectSlots[index], requested);
-    projectSlots[index] = taken.remaining;
-    taken.selected.forEach((interval, chunk) => {
-      events.push(
-        makeEvent(
-          `auto-${project.id}-${dateKey(interval.start)}-${part}-${chunk}`,
-          project.name,
-          interval,
-          type,
-          { projectId: project.id },
-        ),
-      );
-      const duration = minutes(interval.end) - minutes(interval.start);
-      projectMinutes[priority] += duration;
-      manualDailyMinutes[priority][index] += duration;
-    });
-    return taken.unallocated;
-  };
-
-  let p1Remaining = p1Budget;
-  let p2Remaining = p2Budget;
-  if (p1Project) {
-    for (let index = 0; index < DAYS.length && p1Remaining > 0; index += 1) {
-      const dailyGoal = Math.min(
-        120,
-        Math.max(0, 120 - manualDailyMinutes.P1[index]),
-        p1Remaining,
-      );
-      const before = p1Remaining;
-      p1Remaining = allocate(index, p1Project, p1Type, dailyGoal, "P1", 0);
-      const spent = dailyGoal - p1Remaining;
-      p1Remaining = before - spent;
-    }
-    for (let index = 0; index < DAYS.length && p1Remaining > 0; index += 1) {
-      const dailyRoom = Math.max(0, 240 - manualDailyMinutes.P1[index]);
-      if (dailyRoom === 0) continue;
-      const before = p1Remaining;
-      const requested = Math.min(p1Remaining, dailyRoom);
-      const unallocated = allocate(
-        index,
-        p1Project,
-        p1Type,
-        requested,
-        "P1",
-        1,
-      );
-      p1Remaining = before - (requested - unallocated);
-    }
-  }
-  if (activeP2) {
-    for (let index = 0; index < DAYS.length && p2Remaining > 0; index += 1) {
-      const dailyGoal = Math.min(
-        90,
-        Math.max(0, 90 - manualDailyMinutes.P2[index]),
-        p2Remaining,
-      );
-      const before = p2Remaining;
-      const unallocated = allocate(
-        index,
-        activeP2,
-        "PROJECT_P2",
-        dailyGoal,
-        "P2",
-        0,
-      );
-      p2Remaining = before - (dailyGoal - unallocated);
-    }
-    for (let index = 0; index < DAYS.length && p2Remaining > 0; index += 1) {
-      const dailyRoom = Math.max(0, 120 - manualDailyMinutes.P2[index]);
-      if (dailyRoom === 0) continue;
-      const before = p2Remaining;
-      const requested = Math.min(p2Remaining, dailyRoom);
-      const unallocated = allocate(
-        index,
-        activeP2,
-        "PROJECT_P2",
-        requested,
-        "P2",
-        1,
-      );
-      p2Remaining = before - (requested - unallocated);
-    }
-  }
-
-  manualEvents
-    .filter((event) => event.type === "PROJECT_P3")
-    .forEach((manual) => {
-      const requestedStart = new Date(manual.start);
-      const requestedEnd = new Date(manual.end);
-      const duration = minutes(requestedEnd) - minutes(requestedStart);
-      const preferredDay = dayIndex(requestedStart);
-      if (preferredDay < 0 || preferredDay > 4 || duration <= 0) return;
-
-      const exact = { start: requestedStart, end: requestedEnd };
-      let placed: Interval | undefined;
-      for (
-        let index = preferredDay;
-        index < DAYS.length && !placed;
-        index += 1
-      ) {
-        const dailyRoom = 120 - manualDailyMinutes.P3[index];
-        if (duration > dailyRoom) continue;
-        const earliestStart =
-          index === preferredDay
-            ? requestedStart
-            : atTime(
-                new Date(weekStart.getTime() + index * 86_400_000),
-                "09:00",
-              );
-        if (index === preferredDay && claimExact(projectSlots[index], exact)) {
-          placed = exact;
-          break;
-        }
-        if (
-          index === preferredDay &&
-          claimExact(emergencySlotIntervalsByDay[index], exact)
-        ) {
-          placed = exact;
-          break;
-        }
-        placed = takeAtOrAfter(projectSlots[index], earliestStart, duration);
-        if (!placed)
-          placed = takeAtOrAfter(
-            emergencySlotIntervalsByDay[index],
-            earliestStart,
-            duration,
-          );
-      }
-      if (!placed) return;
-
-      events.push({
-        ...manual,
-        start: localDateTime(placed.start),
-        end: localDateTime(placed.end),
-      });
-      const durationMinutes = minutes(placed.end) - minutes(placed.start);
-      projectMinutes.P3 += durationMinutes;
-      manualDailyMinutes.P3[dayIndex(placed.start)] += durationMinutes;
-    });
-
-  const priorityWarnings: ProjectPriority[] = [];
-  if (activeP1 && projectMinutes.P1 < 600) priorityWarnings.push("P1");
-  if (activeP2 && projectMinutes.P2 < 360) priorityWarnings.push("P2");
-
-  const p3DailyRemaining = DAYS.map((_, index) =>
-    Math.max(0, 120 - manualDailyMinutes.P3[index]),
-  );
-  const p3Total = DAYS.reduce((total, _, index) => {
-    const available = [
-      ...projectSlots[index],
-      ...emergencySlotIntervalsByDay[index],
-    ].reduce(
-      (dailyTotal, interval) =>
-        dailyTotal + minutes(interval.end) - minutes(interval.start),
-      0,
-    );
-    return total + Math.min(available, p3DailyRemaining[index]);
-  }, 0);
-  const automaticP3Projects = p3Projects.filter(
-    (project) => !project.day || !project.startTime || !project.endTime,
-  );
-  let p3Used = 0;
-  (priorityWarnings.length === 0 ? automaticP3Projects : []).forEach(
-    (project, projectIndex) => {
-      const share =
-        projectIndex === automaticP3Projects.length - 1
-          ? p3Total - p3Used
-          : Math.floor(p3Total / automaticP3Projects.length);
-      p3Used += share;
-      let remaining = share;
-      for (let index = 0; index < DAYS.length && remaining > 0; index += 1) {
-        let dailyRemaining = Math.min(remaining, p3DailyRemaining[index]);
-        let chunk = 0;
-        while (dailyRemaining > 0) {
-          const candidate = [
-            ...projectSlots[index].map((interval) => ({
-              interval,
-              slots: projectSlots[index],
-            })),
-            ...emergencySlotIntervalsByDay[index].map((interval) => ({
-              interval,
-              slots: emergencySlotIntervalsByDay[index],
-            })),
-          ].sort(
-            (left, right) =>
-              left.interval.start.getTime() - right.interval.start.getTime(),
-          )[0];
-          if (!candidate) break;
-          const duration = Math.min(
-            dailyRemaining,
-            minutes(candidate.interval.end) - minutes(candidate.interval.start),
-          );
-          const interval = takeAtOrAfter(
-            candidate.slots,
-            candidate.interval.start,
-            duration,
-          );
-          if (!interval) break;
-          events.push(
-            makeEvent(
-              `auto-${project.id}-${dateKey(interval.start)}-p3-${chunk}`,
-              project.name,
-              interval,
-              "PROJECT_P3",
-              { projectId: project.id },
-            ),
-          );
-          chunk += 1;
-          projectMinutes.P3 += duration;
-          manualDailyMinutes.P3[index] += duration;
-          p3DailyRemaining[index] -= duration;
-          remaining -= duration;
-          dailyRemaining -= duration;
-        }
-      }
-    },
-  );
-
-  manualEvents
-    .filter((event) => event.type === "CUSTOM")
-    .forEach((manual) => {
-      const requestedStart = new Date(manual.start);
-      const requestedEnd = new Date(manual.end);
-      const duration = minutes(requestedEnd) - minutes(requestedStart);
-      const preferredDay = dayIndex(requestedStart);
-      if (preferredDay < 0 || preferredDay > 4 || duration <= 0) return;
-
-      const exact = { start: requestedStart, end: requestedEnd };
-      let placed: Interval | undefined;
-      if (claimExact(projectSlots[preferredDay], exact)) placed = exact;
-      if (
-        !placed &&
-        claimExact(emergencySlotIntervalsByDay[preferredDay], exact)
-      )
-        placed = exact;
-      for (
-        let index = preferredDay;
-        index < DAYS.length && !placed;
-        index += 1
-      ) {
-        const earliest =
-          index === preferredDay
-            ? requestedStart
-            : atTime(
-                new Date(weekStart.getTime() + index * 86_400_000),
-                "09:00",
-              );
-        placed = takeAtOrAfter(projectSlots[index], earliest, duration);
-        if (!placed)
-          placed = takeAtOrAfter(
-            emergencySlotIntervalsByDay[index],
-            earliest,
-            duration,
-          );
-      }
-      if (placed)
-        events.push({
-          ...manual,
-          start: localDateTime(placed.start),
-          end: localDateTime(placed.end),
-        });
-    });
-
-  emergencySlotIntervalsByDay.forEach((intervals, index) => {
-    intervals.forEach((interval, part) => {
-      availableEmergencySlots.push(
-        makeEvent(
-          `buffer-${index}-${part}`,
-          "Slot urgenze",
-          interval,
-          "EMERGENCY_SLOT",
-          { fixed: false, editable: false },
-        ),
-      );
-      bufferMinutes += minutes(interval.end) - minutes(interval.start);
-    });
-  });
-
-  void assigned;
-  return {
-    events: events.sort((a, b) => a.start.localeCompare(b.start)),
-    availableEmergencySlots,
-    projectMinutes,
-    priorityWarnings,
-    bufferMinutes,
-    emergencyMinutes,
-    unscheduledEmergencyMinutes,
-  };
+/** Intervalli liberi di un giorno, escludendo gli eventi indicati e il passato. */
+export function freeIntervals(
+	settings: Settings,
+	date: Date,
+	blockers: CalendarEvent[],
+	from?: Date,
+): Interval[] {
+	let free = workWindow(settings, date)
+	for (const event of blockers.filter(occupies))
+		free = subtract(free, {
+			start: new Date(event.start),
+			end: new Date(event.end),
+		})
+	if (from) {
+		const earliest = roundUpToQuarter(from)
+		free = subtract(free, { start: atTime(date, 0), end: earliest })
+	}
+	return free.filter((interval) => minutesOf(interval) > 0)
 }
+
+/** Controlla che lo slot rispetti orari lavorativi, pausa e preparazione. */
+export function withinWorkingHours(
+	settings: Settings,
+	event: CalendarEvent,
+): boolean {
+	const start = new Date(event.start)
+	const end = new Date(event.end)
+	if (!(start < end) || dateKey(start) !== dateKey(end)) return false
+	return workWindow(settings, start).some(
+		(interval) => interval.start <= start && interval.end >= end,
+	)
+}
+
+/** Coppie di slot sovrapposti che l'utente deve risolvere. */
+export function findConflicts(events: CalendarEvent[]): Conflict[] {
+	const active = events
+		.filter(occupies)
+		.sort((a, b) => a.start.localeCompare(b.start))
+	const conflicts: Conflict[] = []
+	for (let left = 0; left < active.length; left += 1)
+		for (let right = left + 1; right < active.length; right += 1) {
+			const a = active[left]
+			const b = active[right]
+			if (b.start >= a.end) break
+			if (!overlaps(a, b)) continue
+			const [higher, lower] =
+				PRIORITY[a.type] <= PRIORITY[b.type] ? [a, b] : [b, a]
+			conflicts.push({ id: `${higher.id}|${lower.id}`, higher, lower })
+		}
+	return conflicts
+}
+
+function dailyMinutes(
+	events: CalendarEvent[],
+	type: EventType,
+	date: Date,
+	exceptId?: string,
+) {
+	return events
+		.filter(
+			(event) =>
+				event.type === type &&
+				event.id !== exceptId &&
+				!event.declined &&
+				dateKey(new Date(event.start)) === dateKey(date),
+		)
+		.reduce((total, event) => total + durationOf(event), 0)
+}
+
+/**
+ * Valida uno slot inserito/spostato manualmente. L'orario non viene mai modificato:
+ * se esiste già uno slot di priorità superiore l'inserimento è rifiutato.
+ */
+export function validateManual(
+	candidate: CalendarEvent,
+	events: CalendarEvent[],
+	settings: Settings,
+): string | undefined {
+	if (candidate.type === 'VACATION') {
+		if (!isWorkingDay(settings, new Date(candidate.start)))
+			return 'Il giorno selezionato non è lavorativo o è festivo.'
+		return undefined
+	}
+	if (!withinWorkingHours(settings, candidate))
+		return 'Lo slot deve rientrare negli orari lavorativi, fuori da pausa pranzo, preparazione postazione e festivi.'
+	const others = events.filter(
+		(event) => event.id !== candidate.id && occupies(event),
+	)
+	const higher = others.find(
+		(event) =>
+			overlaps(event, candidate) &&
+			PRIORITY[event.type] < PRIORITY[candidate.type],
+	)
+	if (higher)
+		return `Lo slot si sovrappone a "${higher.title}" (${TYPE_LABELS[higher.type]}), che ha priorità superiore.`
+	const cap = DAILY_CAPS[candidate.type]
+	if (cap !== undefined) {
+		const used = dailyMinutes(
+			events,
+			candidate.type,
+			new Date(candidate.start),
+			candidate.id,
+		)
+		if (used + durationOf(candidate) > cap)
+			return `Limite giornaliero di ${cap / 60} h per ${TYPE_LABELS[candidate.type]} superato.`
+	}
+	if (candidate.type === 'EMERGENCY') {
+		const sameDay = events.some(
+			(event) =>
+				event.type === 'EMERGENCY' &&
+				event.id !== candidate.id &&
+				dateKey(new Date(event.start)) === dateKey(new Date(candidate.start)),
+		)
+		if (sameDay) return 'È consentito un solo slot di emergenza al giorno.'
+	}
+	return undefined
+}
+
+/** Dove inserire per primo nel giorno lo slot, rispetto agli eventi che lo bloccano. */
+function firstFit(
+	intervals: Interval[],
+	duration: number,
+): Interval | undefined {
+	const slot = intervals.find((interval) => minutesOf(interval) >= duration)
+	if (!slot) return undefined
+	return {
+		start: slot.start,
+		end: new Date(slot.start.getTime() + duration * 60_000),
+	}
+}
+
+function remainingDays(
+	settings: Settings,
+	weekStart: Date,
+	now: Date,
+	fromDate?: Date,
+) {
+	return weekDays(settings, weekStart).filter(
+		(day) =>
+			!day.holiday &&
+			atTime(day.date, dayEnd(settings, day.index)) > now &&
+			(!fromDate || day.key >= dateKey(fromDate)),
+	)
+}
+
+/** Sposta uno slot di bassa priorità nel primo spazio completamente libero. */
+function relocate(
+	event: CalendarEvent,
+	events: CalendarEvent[],
+	settings: Settings,
+	weekStart: Date,
+	now: Date,
+): CalendarEvent | undefined {
+	const duration = durationOf(event)
+	const blockers = events.filter((item) => item.id !== event.id)
+	const original = new Date(event.start)
+	const days = remainingDays(settings, weekStart, now)
+	const ordered = [
+		...days.filter((day) => day.key >= dateKey(original)),
+		...days.filter((day) => day.key < dateKey(original)),
+	]
+	for (const day of ordered) {
+		const free = freeIntervals(settings, day.date, blockers, now)
+		const cap = DAILY_CAPS[event.type]
+		if (
+			cap !== undefined &&
+			dailyMinutes(blockers, event.type, day.date) + duration > cap
+		)
+			continue
+		const fit = firstFit(free, duration)
+		if (fit)
+			return {
+				...event,
+				start: localDateTime(fit.start),
+				end: localDateTime(fit.end),
+			}
+	}
+	return undefined
+}
+
+/** Come `relocate`, ma uno slot progetto può essere diviso su più giorni rispettando i limiti giornalieri. */
+function relocateSplit(
+	event: CalendarEvent,
+	events: CalendarEvent[],
+	settings: Settings,
+	weekStart: Date,
+	now: Date,
+): { pieces: CalendarEvent[]; unplaced: number } {
+	const whole = relocate(event, events, settings, weekStart, now)
+	if (whole || !event.type.startsWith('PROJECT'))
+		return {
+			pieces: whole ? [whole] : [],
+			unplaced: whole ? 0 : durationOf(event),
+		}
+	const blockers = events.filter((item) => item.id !== event.id)
+	const cap = DAILY_CAPS[event.type] ?? 120
+	const pieces: CalendarEvent[] = []
+	let left = durationOf(event)
+	for (const day of remainingDays(settings, weekStart, now)) {
+		if (left <= 0) break
+		const room =
+			cap - dailyMinutes([...blockers, ...pieces], event.type, day.date)
+		if (room <= 0) continue
+		const free = freeIntervals(
+			settings,
+			day.date,
+			[...blockers, ...pieces],
+			now,
+		)
+		takeFromStart(free, Math.min(room, left)).forEach((interval, part) => {
+			pieces.push({
+				...event,
+				id: `${event.id}-${day.key}-${part}`,
+				start: localDateTime(interval.start),
+				end: localDateTime(interval.end),
+			})
+			left -= minutesOf(interval)
+		})
+	}
+	return { pieces, unplaced: left }
+}
+
+export interface PlacementResult {
+	events: CalendarEvent[]
+	messages: string[]
+	nextWeekAlert?: string
+	placed?: CalendarEvent
+}
+
+/**
+ * Inserisce un'emergenza nel primo slot non occupato da permessi, ferie, meeting
+ * o blocchi obbligatori, spostando automaticamente gli slot di priorità inferiore.
+ */
+export function placeEmergency(
+	title: string,
+	duration: number,
+	events: CalendarEvent[],
+	settings: Settings,
+	weekStart: Date,
+	now: Date,
+): PlacementResult {
+	const messages: string[] = []
+	const strong = events.filter(
+		(event) => PRIORITY[event.type] <= PRIORITY.EMERGENCY,
+	)
+	const days = remainingDays(settings, weekStart, now)
+	const todayKey = dateKey(now)
+	for (const day of days) {
+		const hasEmergency = events.some(
+			(event) =>
+				event.type === 'EMERGENCY' &&
+				dateKey(new Date(event.start)) === day.key,
+		)
+		if (hasEmergency) {
+			messages.push(
+				`${day.name} ha già uno slot di emergenza: l'emergenza viene impostata al giorno successivo.`,
+			)
+			continue
+		}
+		const fit = firstFit(
+			freeIntervals(settings, day.date, strong, now),
+			duration,
+		)
+		if (!fit) continue
+		const placed = makeEvent(
+			`emergency-${crypto.randomUUID()}`,
+			title,
+			fit,
+			'EMERGENCY',
+		)
+		let next = [...events, placed]
+		const displaced = next.filter(
+			(event) =>
+				event.id !== placed.id &&
+				occupies(event) &&
+				PRIORITY[event.type] > PRIORITY.EMERGENCY &&
+				overlaps(event, placed),
+		)
+		for (const item of displaced) {
+			next = next.filter((event) => event.id !== item.id)
+			const itemInterval = {
+				start: new Date(item.start),
+				end: new Date(item.end),
+			}
+			// Gli slot progetto restano dove non toccano l'emergenza: si sposta solo la parte sovrapposta.
+			const kept = item.type.startsWith('PROJECT')
+				? subtract([itemInterval], fit).map((interval, part) => ({
+						...item,
+						id: `${item.id}-k${part}`,
+						start: localDateTime(interval.start),
+						end: localDateTime(interval.end),
+					}))
+				: []
+			next.push(...kept)
+			const overlap = kept.length
+				? {
+						...item,
+						start: localDateTime(
+							new Date(
+								Math.max(itemInterval.start.getTime(), fit.start.getTime()),
+							),
+						),
+						end: localDateTime(
+							new Date(Math.min(itemInterval.end.getTime(), fit.end.getTime())),
+						),
+					}
+				: item
+			const { pieces, unplaced } = relocateSplit(
+				overlap,
+				next,
+				settings,
+				weekStart,
+				now,
+			)
+			next.push(...pieces)
+			if (pieces.length)
+				messages.push(
+					`"${item.title}" (${TYPE_LABELS[item.type]}): ${durationOf(overlap) - unplaced} min spostati a ${pieces.map((piece) => `${piece.start.slice(5, 10)} ${piece.start.slice(11, 16)}`).join(', ')}.`,
+				)
+			if (unplaced > 0)
+				messages.push(
+					`"${item.title}" (${TYPE_LABELS[item.type]}): ${unplaced} min rimossi, nessuno spazio libero in settimana.`,
+				)
+		}
+		if (
+			day.key !== todayKey &&
+			days[0]?.key === todayKey &&
+			messages.length === 0
+		)
+			messages.push(
+				`Oggi non c'è spazio libero: emergenza impostata a ${day.name}.`,
+			)
+		return { events: next, messages, placed }
+	}
+	const alert = `Emergenza "${title}" (${duration} min) non inseribile questa settimana: da pianificare la settimana prossima.`
+	messages.push(alert)
+	return { events, messages, nextWeekAlert: alert }
+}
+
+/** Inserisce automaticamente uno slot P3 nel primo spazio libero (max 2 h al giorno). */
+export function placeP3(
+	project: Project,
+	events: CalendarEvent[],
+	settings: Settings,
+	weekStart: Date,
+	now: Date,
+): CalendarEvent | undefined {
+	const duration = project.durationMinutes ?? 60
+	const days = remainingDays(settings, weekStart, now)
+	const sorted = [...days].sort(
+		(a, b) =>
+			dailyMinutes(events, 'PROJECT_P3', a.date) -
+				dailyMinutes(events, 'PROJECT_P3', b.date) || a.index - b.index,
+	)
+	for (const day of sorted) {
+		if (dailyMinutes(events, 'PROJECT_P3', day.date) + duration > 120) continue
+		const fit = firstFit(
+			freeIntervals(settings, day.date, events, now),
+			duration,
+		)
+		if (fit)
+			return makeEvent(
+				`p3-${crypto.randomUUID()}`,
+				project.name,
+				fit,
+				'PROJECT_P3',
+				{
+					projectId: project.id,
+				},
+			)
+	}
+	return undefined
+}
+
+export interface PlanResult {
+	events: CalendarEvent[]
+	alerts: string[]
+}
+
+/** Divide `total` minuti tra i giorni a blocchi da 15 min, in modo uniforme. */
+function spreadEvenly(total: number, capacity: number[]): number[] {
+	const quota = capacity.map(() => 0)
+	let remaining = Math.floor(total / QUARTER) * QUARTER
+	let progressed = true
+	while (remaining > 0 && progressed) {
+		progressed = false
+		for (let index = 0; index < capacity.length && remaining > 0; index += 1) {
+			if (quota[index] + QUARTER > capacity[index]) continue
+			quota[index] += QUARTER
+			remaining -= QUARTER
+			progressed = true
+		}
+	}
+	return quota
+}
+
+function takeFromStart(intervals: Interval[], requested: number): Interval[] {
+	const selected: Interval[] = []
+	let left = requested
+	for (const interval of intervals) {
+		if (left <= 0) break
+		const length = Math.min(left, minutesOf(interval))
+		if (length <= 0) continue
+		selected.push({
+			start: interval.start,
+			end: new Date(interval.start.getTime() + length * 60_000),
+		})
+		left -= length
+	}
+	return selected
+}
+
+/**
+ * "Rigenera piano": ridistribuisce solo gli slot automatici P1/P2/P3 futuri e
+ * ricolloca gli slot "Altro" in conflitto. Permessi, ferie, meeting, emergenze e
+ * slot forzati manualmente non vengono toccati.
+ */
+export function regeneratePlan(
+	week: WeekInput,
+	frame: CalendarEvent[],
+	settings: Settings,
+	weekStart: Date,
+	now: Date,
+): PlanResult {
+	const alerts: string[] = []
+	const isFutureAuto = (event: CalendarEvent) =>
+		event.source === 'auto' &&
+		new Date(event.start) >= now &&
+		['PROJECT_P1', 'PROJECT_P2', 'PROJECT_P3'].includes(event.type)
+	let events = week.events.filter((event) => !isFutureAuto(event))
+	const days = remainingDays(settings, weekStart, now)
+
+	const allocateProject = (
+		project: Project,
+		total: number,
+		dailyCap: number,
+	) => {
+		const type = projectType(project.priority)
+		const blockers = () => [...frame, ...events]
+		const capacity = days.map((day) => {
+			const free = freeIntervals(settings, day.date, blockers(), now).reduce(
+				(sum, interval) => sum + minutesOf(interval),
+				0,
+			)
+			return Math.max(
+				0,
+				Math.min(free, dailyCap - dailyMinutes(events, type, day.date)),
+			)
+		})
+		const quota = spreadEvenly(total, capacity)
+		let placed = 0
+		days.forEach((day, index) => {
+			if (quota[index] <= 0) return
+			const free = freeIntervals(settings, day.date, blockers(), now)
+			takeFromStart(free, quota[index]).forEach((interval, part) => {
+				events.push(
+					makeEvent(
+						`auto-${project.id}-${day.key}-${part}`,
+						project.name,
+						interval,
+						type,
+						{ projectId: project.id },
+					),
+				)
+				placed += minutesOf(interval)
+			})
+		})
+		return placed
+	}
+
+	for (const priority of ['P1', 'P2'] as const) {
+		const type = projectType(priority)
+		const dailyCap = DAILY_CAPS[type] ?? 120
+		for (const project of week.projects.filter(
+			(item) => item.priority === priority,
+		)) {
+			const target = Math.min(
+				WEEKLY_MAX[priority],
+				Math.max(settings.minBudgets[priority], project.budgetMinutes ?? 0),
+			)
+			const already = events
+				.filter(
+					(event) =>
+						event.projectId === project.id &&
+						event.type === type &&
+						!event.declined,
+				)
+				.reduce((sum, event) => sum + durationOf(event), 0)
+			const missing = Math.max(0, target - already)
+			const placed =
+				missing > 0 ? allocateProject(project, missing, dailyCap) : 0
+			if (placed < missing)
+				alerts.push(
+					`${priority} "${project.name}": ${((missing - placed) / 60).toFixed(2)} h non pianificate (calendario pieno).`,
+				)
+		}
+	}
+
+	for (const project of week.projects.filter(
+		(item) => item.priority === 'P3',
+	)) {
+		const exists = events.some((event) => event.projectId === project.id)
+		if (exists) continue
+		const slot = placeP3(
+			project,
+			[...frame, ...events],
+			settings,
+			weekStart,
+			now,
+		)
+		if (slot) events.push(slot)
+		else
+			alerts.push(
+				`P3 "${project.name}": slot da ${project.durationMinutes ?? 60} min rimasto fuori dal calendario.`,
+			)
+	}
+
+	const customInConflict = events.filter(
+		(event) =>
+			event.type === 'CUSTOM' &&
+			new Date(event.start) >= now &&
+			[...frame, ...events].some(
+				(other) =>
+					other.id !== event.id &&
+					occupies(other) &&
+					PRIORITY[other.type] < PRIORITY.CUSTOM &&
+					overlaps(other, event),
+			),
+	)
+	for (const item of customInConflict) {
+		const moved = relocate(
+			item,
+			[...frame, ...events],
+			settings,
+			weekStart,
+			now,
+		)
+		events = events.filter((event) => event.id !== item.id)
+		if (moved) {
+			events.push(moved)
+			alerts.push(
+				`Altro "${item.title}" spostato a ${moved.start.slice(0, 10)} ${moved.start.slice(11, 16)}.`,
+			)
+		} else alerts.push(`Altro "${item.title}" rimasto fuori dal calendario.`)
+	}
+
+	return { events, alerts }
+}
+
+/**
+ * Dopo l'inserimento di uno slot di priorità superiore, gli slot "Altro"
+ * sovrapposti vengono spostati automaticamente (con segnalazione).
+ */
+export function displaceCustom(
+	inserted: CalendarEvent,
+	events: CalendarEvent[],
+	frame: CalendarEvent[],
+	settings: Settings,
+	weekStart: Date,
+	now: Date,
+): { events: CalendarEvent[]; messages: string[] } {
+	if (inserted.type === 'CUSTOM') return { events, messages: [] }
+	let next = events
+	const messages: string[] = []
+	const hit = events.filter(
+		(event) =>
+			event.type === 'CUSTOM' &&
+			event.id !== inserted.id &&
+			(inserted.type === 'VACATION'
+				? dateKey(new Date(event.start)) === dateKey(new Date(inserted.start))
+				: overlaps(event, inserted)),
+	)
+	for (const item of hit) {
+		const moved = relocate(item, [...frame, ...next], settings, weekStart, now)
+		next = next.filter((event) => event.id !== item.id)
+		if (moved) {
+			next = [...next, moved]
+			messages.push(
+				`"${item.title}" (Altro) spostato a ${moved.start.slice(0, 10)} ${moved.start.slice(11, 16)}.`,
+			)
+		} else
+			messages.push(
+				`"${item.title}" (Altro) rimosso: nessuno spazio libero in settimana.`,
+			)
+	}
+	return { events: next, messages }
+}
+
+export function vacationInterval(settings: Settings, date: Date): Interval {
+	return {
+		start: atTime(date, settings.workStart),
+		end: atTime(date, dayEnd(settings, dayIndex(date))),
+	}
+}
+
+export function minutesByType(events: CalendarEvent[]): Record<string, number> {
+	const totals: Record<string, number> = {}
+	for (const event of events.filter(occupies))
+		totals[event.type] = (totals[event.type] ?? 0) + durationOf(event)
+	return totals
+}
+
+export function projectMinutes(
+	events: CalendarEvent[],
+	priority: ProjectPriority,
+) {
+	return minutesByType(events)[projectType(priority)] ?? 0
+}
+
+export { addDays }

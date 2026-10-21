@@ -1,209 +1,152 @@
 import { atom } from 'jotai'
 import {
+	addDays,
 	type CalendarEvent,
-	type Emergency,
+	DEFAULT_SETTINGS,
 	getMonday,
 	type Project,
+	previousWeekCutoff,
+	type Settings,
 	weekKey,
 } from './scheduler'
 
-const STORAGE_KEY = 'devplanner:planner:v1'
+const STORAGE_KEY = 'devplanner:planner:v2'
+const LEGACY_KEY = 'devplanner:planner:v1'
 
 export interface Retrospective {
-	notes: string
-	completedTasks: string
 	nextWeek: string
 }
 
 export interface WeekPlannerData {
 	projects: Project[]
-	emergencies: Emergency[]
-	meetings: CalendarEvent[]
-	weeklyBudgets: { P1: number; P2: number }
-	customEvents: CalendarEvent[]
-	eventOverrides: Record<string, CalendarEvent>
-	deletedEventIds: string[]
+	events: CalendarEvent[]
+	declinedFixed: string[]
+	/** Slot rimasti fuori dal calendario dopo "Rigenera piano" */
+	planAlerts: string[]
 	retrospective: Retrospective
 }
 
 export interface PlannerData {
+	settings: Settings
 	weeks: Record<string, WeekPlannerData>
-	meetingCleanupWeek: string
 	retrospectiveAlertWeek: string
 }
 
 export const EMPTY_WEEK_DATA: WeekPlannerData = {
 	projects: [],
-	emergencies: [],
-	meetings: [],
-	weeklyBudgets: { P1: 600, P2: 360 },
-	customEvents: [],
-	eventOverrides: {},
-	deletedEventIds: [],
-	retrospective: { notes: '', completedTasks: '', nextWeek: '' },
+	events: [],
+	declinedFixed: [],
+	planAlerts: [],
+	retrospective: { nextWeek: '' },
 }
 
-function isWeekPlannerData(
-	value: unknown,
-): value is Partial<WeekPlannerData> &
-	Pick<
-		WeekPlannerData,
-		| 'projects'
-		| 'emergencies'
-		| 'customEvents'
-		| 'deletedEventIds'
-		| 'eventOverrides'
-		| 'retrospective'
-	> {
-	if (!value || typeof value !== 'object') return false
-	const candidate = value as Partial<WeekPlannerData>
-	return (
-		Array.isArray(candidate.projects) &&
-		Array.isArray(candidate.emergencies) &&
-		Array.isArray(candidate.customEvents) &&
-		Array.isArray(candidate.deletedEventIds) &&
-		Boolean(
-			candidate.eventOverrides && typeof candidate.eventOverrides === 'object',
-		) &&
-		Boolean(
-			candidate.retrospective && typeof candidate.retrospective === 'object',
-		)
-	)
+const EMPTY_DATA: PlannerData = {
+	settings: DEFAULT_SETTINGS,
+	weeks: {},
+	retrospectiveAlertWeek: '',
 }
 
 function normalizeWeek(value: Partial<WeekPlannerData>): WeekPlannerData {
 	return {
-		...EMPTY_WEEK_DATA,
-		...value,
-		emergencies: (value.emergencies ?? []).map(normalizeEmergency),
-		meetings: value.meetings ?? [],
-		weeklyBudgets: value.weeklyBudgets ?? { P1: 600, P2: 360 },
+		projects: Array.isArray(value.projects) ? value.projects : [],
+		events: Array.isArray(value.events) ? value.events : [],
+		declinedFixed: Array.isArray(value.declinedFixed)
+			? value.declinedFixed
+			: [],
+		planAlerts: Array.isArray(value.planAlerts) ? value.planAlerts : [],
+		retrospective: { nextWeek: value.retrospective?.nextWeek ?? '' },
 	}
 }
 
-function normalizeEmergency(emergency: Emergency): Emergency {
-	const withStatus = {
-		...emergency,
-		status: emergency.status ?? ('TODO' as const),
+/** Recupera progetti e note dalla versione precedente del salvataggio. */
+function migrateLegacy(): PlannerData | undefined {
+	const stored = window.localStorage.getItem(LEGACY_KEY)
+	if (!stored) return undefined
+	const legacy = JSON.parse(stored) as {
+		weeks?: Record<
+			string,
+			{
+				projects?: Project[]
+				weeklyBudgets?: { P1: number; P2: number }
+				retrospective?: Retrospective
+			}
+		>
 	}
-	if (!emergency.startTime) return withStatus
-	const [startHours, startMinutes = 0] = emergency.startTime
-		.split(':')
-		.map(Number)
-	const startHour = Math.floor((startHours * 60 + startMinutes) / 60)
-	const endMinutes = emergency.endTime
-		? emergency.endTime
-				.split(':')
-				.map(Number)
-				.reduce(
-					(hour, minute, index) => hour + minute * (index === 0 ? 60 : 1),
-					0,
-				)
-		: startHours * 60 + startMinutes + emergency.durationMinutes
-	const endHour = Math.ceil(endMinutes / 60)
-	const format = (hour: number) => `${String(hour).padStart(2, '0')}:00`
-	return {
-		...withStatus,
-		startTime: format(startHour),
-		endTime: format(endHour),
-		durationMinutes: Math.max(60, (endHour - startHour) * 60),
-	}
+	const weeks = Object.fromEntries(
+		Object.entries(legacy.weeks ?? {}).map(([key, week]) => [
+			key,
+			normalizeWeek({
+				projects: (week.projects ?? []).map((project) => ({
+					id: project.id,
+					name: project.name,
+					description: project.description ?? '',
+					priority: project.priority,
+					budgetMinutes:
+						project.priority === 'P3'
+							? undefined
+							: week.weeklyBudgets?.[project.priority],
+					durationMinutes: project.priority === 'P3' ? 60 : undefined,
+				})),
+				retrospective: { nextWeek: week.retrospective?.nextWeek ?? '' },
+			}),
+		]),
+	)
+	return { ...EMPTY_DATA, weeks }
 }
 
-export function expireWeeklyMeetings(
+/**
+ * Dal martedì alle 10:00 gli eventi delle settimane precedenti vengono eliminati.
+ * La nota retrospettiva della settimana appena chiusa resta per il promemoria.
+ */
+export function expireOldWeeks(
 	data: PlannerData,
 	now = new Date(),
 ): PlannerData {
-	const monday = getMonday(now)
-	const cutoff = new Date(monday)
-	cutoff.setHours(14, 0, 0, 0)
-	const currentWeek = weekKey(monday)
-	if (now < cutoff || data.meetingCleanupWeek === currentWeek) return data
-	return {
-		...data,
-		meetingCleanupWeek: currentWeek,
-		weeks: Object.fromEntries(
-			Object.entries(data.weeks).map(([key, week]) => [
-				key,
-				{ ...week, meetings: [] },
-			]),
-		),
-	}
+	const current = getMonday(now)
+	const previous = addDays(current, -7)
+	const currentKey = weekKey(current)
+	const previousKey = weekKey(previous)
+	const afterCutoff = now >= previousWeekCutoff(previous)
+	let changed = false
+	const weeks = Object.fromEntries(
+		Object.entries(data.weeks).flatMap(([key, week]) => {
+			if (key >= currentKey) return [[key, week]]
+			if (key === previousKey && !afterCutoff) return [[key, week]]
+			const empty = week.events.length === 0 && week.projects.length === 0
+			if (key === previousKey && week.retrospective.nextWeek.trim()) {
+				if (empty) return [[key, week]]
+				changed = true
+				return [
+					[key, { ...EMPTY_WEEK_DATA, retrospective: week.retrospective }],
+				]
+			}
+			changed = true
+			return []
+		}),
+	)
+	return changed ? { ...data, weeks } : data
 }
 
 export function loadPlannerData(now = new Date()): PlannerData {
-	if (typeof window === 'undefined')
-		return { weeks: {}, meetingCleanupWeek: '', retrospectiveAlertWeek: '' }
-
+	if (typeof window === 'undefined') return EMPTY_DATA
 	try {
 		const stored = window.localStorage.getItem(STORAGE_KEY)
-		const parsed: unknown = stored ? JSON.parse(stored) : { weeks: {} }
-		if (!parsed || typeof parsed !== 'object' || !('weeks' in parsed))
-			return { weeks: {}, meetingCleanupWeek: '', retrospectiveAlertWeek: '' }
-
-		const parsedData = parsed as {
-			weeks: Record<string, unknown>
-			meetingCleanupWeek?: string
-			retrospectiveAlertWeek?: string
+		const parsed = stored
+			? (JSON.parse(stored) as Partial<PlannerData>)
+			: (migrateLegacy() ?? EMPTY_DATA)
+		const data: PlannerData = {
+			settings: { ...DEFAULT_SETTINGS, ...parsed.settings },
+			weeks: Object.fromEntries(
+				Object.entries(parsed.weeks ?? {}).map(([key, week]) => [
+					key,
+					normalizeWeek(week),
+				]),
+			),
+			retrospectiveAlertWeek: parsed.retrospectiveAlertWeek ?? '',
 		}
-		const weeks = parsedData.weeks
-		if (!weeks || typeof weeks !== 'object')
-			return { weeks: {}, meetingCleanupWeek: '', retrospectiveAlertWeek: '' }
-
-		const currentWeekKey = weekKey(getMonday(now))
-		let changed = false
-		const validWeeks = Object.fromEntries(
-			Object.entries(weeks).flatMap(([key, value]) => {
-				if (!isWeekPlannerData(value)) {
-					changed = true
-					return []
-				}
-
-				const week = normalizeWeek(value)
-				if (
-					value.emergencies.some(
-						(emergency) => emergency.startTime && !emergency.endTime,
-					)
-				)
-					changed = true
-				if (
-					key < currentWeekKey &&
-					(week.customEvents.length > 0 ||
-						Object.keys(week.eventOverrides).length > 0 ||
-						week.deletedEventIds.length > 0)
-				) {
-					changed = true
-					return [
-						[
-							key,
-							{
-								...week,
-								customEvents: [],
-								eventOverrides: {},
-								deletedEventIds: [],
-							},
-						],
-					]
-				}
-
-				return [[key, week]]
-			}),
-		)
-
-		const previousCleanupWeek = parsedData.meetingCleanupWeek ?? ''
-		const data = expireWeeklyMeetings(
-			{
-				weeks: validWeeks,
-				meetingCleanupWeek: previousCleanupWeek,
-				retrospectiveAlertWeek: parsedData.retrospectiveAlertWeek ?? '',
-			},
-			now,
-		)
-		if (changed || data.meetingCleanupWeek !== previousCleanupWeek)
-			savePlannerData(data)
-		return data
+		return expireOldWeeks(data, now)
 	} catch {
-		return { weeks: {}, meetingCleanupWeek: '', retrospectiveAlertWeek: '' }
+		return EMPTY_DATA
 	}
 }
 
